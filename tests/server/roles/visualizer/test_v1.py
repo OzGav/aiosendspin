@@ -20,6 +20,7 @@ from aiosendspin.models.visualizer import (
     ClientHelloVisualizerSupport,
     StreamRequestFormatVisualizer,
 )
+from aiosendspin.noise.keys import Identity
 from aiosendspin.server.roles.base import AudioChunk
 from aiosendspin.server.roles.visualizer.v1 import VisualizerV1Role
 from aiosendspin.server.server import SendspinServer
@@ -1042,7 +1043,13 @@ def test_refresh_pitch_setting_noop_when_unchanged() -> None:
 
 async def test_server_set_pitch_enabled_fans_out_to_roles() -> None:
     """SendspinServer.set_visualizer_pitch_enabled refreshes every active role once."""
-    server = SendspinServer(asyncio.get_running_loop(), "srv", "Srv", MagicMock())
+    server = SendspinServer(
+        asyncio.get_running_loop(),
+        Identity.generate(),
+        "Srv",
+        MagicMock(),
+        pairing_store=MagicMock(),
+    )
     role = MagicMock()
     role.refresh_pitch_setting = MagicMock()
     other = MagicMock(spec=[])  # no refresh_pitch_setting attr → skipped

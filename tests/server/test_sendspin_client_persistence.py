@@ -111,6 +111,7 @@ async def test_goodbye_disconnect_delays_buffer_tracker_reset(
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     client.mark_connected()
@@ -141,6 +142,7 @@ async def test_ungraceful_disconnect_delays_buffer_tracker_reset(
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     client.mark_connected()
@@ -167,6 +169,7 @@ async def test_reconnect_resets_buffer_tracker() -> None:
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     client.mark_connected()
@@ -184,6 +187,7 @@ async def test_reconnect_resets_buffer_tracker() -> None:
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     client.mark_connected()
@@ -214,6 +218,7 @@ async def test_reconnect_refreshes_audio_requirements_from_new_hello() -> None:
                 )
             ],
         ),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     client.mark_connected()
@@ -241,6 +246,7 @@ async def test_reconnect_refreshes_audio_requirements_from_new_hello() -> None:
                 )
             ],
         ),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     client.mark_connected()
@@ -278,6 +284,7 @@ async def test_reconnect_with_new_format_drops_stale_cached_audio() -> None:
                 )
             ],
         ),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     client.mark_connected()
@@ -312,6 +319,7 @@ async def test_reconnect_with_new_format_drops_stale_cached_audio() -> None:
                 )
             ],
         ),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     client.mark_connected()
@@ -354,6 +362,7 @@ async def test_transient_disconnect_reuses_role_instance_and_preserves_lifecycle
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     first_role = client.role("player@v1")
@@ -369,11 +378,56 @@ async def test_transient_disconnect_reuses_role_instance_and_preserves_lifecycle
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     assert client.role("player@v1") is first_role
     assert tracked_role.on_connect.call_count == 2
     assert tracked_role.on_disconnect.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_attach_with_empty_active_roles_creates_no_roles() -> None:
+    """An idle/pairing connection (empty active_roles) activates no role instances."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+    client = SendspinClient(server, client_id="player-1")
+    SendspinGroup(server, client)
+
+    client.attach_connection(
+        _DummyConnection(),
+        client_info=_player_hello("player-1"),
+        active_roles=[],
+        negotiated_roles=[Roles.PLAYER.value],
+    )
+
+    assert client.active_roles == []
+    assert client.role("player@v1") is None
+    # Capability set is retained even though no role is activated.
+    assert client.negotiated_role_ids == [Roles.PLAYER.value]
+
+
+@pytest.mark.asyncio
+async def test_set_active_roles_activates_then_deactivates() -> None:
+    """set_active_roles creates roles on activation and tears them down on deactivation."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+    client = SendspinClient(server, client_id="player-1")
+    SendspinGroup(server, client)
+
+    client.attach_connection(
+        _DummyConnection(),
+        client_info=_player_hello("player-1"),
+        active_roles=[],
+        negotiated_roles=[Roles.PLAYER.value],
+    )
+
+    client.set_active_roles([Roles.PLAYER.value])
+    assert client.role("player@v1") is not None
+
+    client.set_active_roles([])
+    assert client.role("player@v1") is None
+    assert client.active_roles == []
 
 
 @pytest.mark.asyncio
@@ -387,6 +441,7 @@ async def test_hard_disconnect_clears_roles() -> None:
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     assert client.role("player@v1") is not None
@@ -423,6 +478,7 @@ async def test_stale_connection_disconnect_does_not_wipe_newer_connection(
     client.attach_connection(
         old_conn,
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     old_conn._client = client  # mirror what SendspinConnection sets after attach  # noqa: SLF001
@@ -451,6 +507,7 @@ async def test_stale_connection_disconnect_does_not_wipe_newer_connection(
     client.attach_connection(
         new_conn,
         client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     new_conn._client = client  # mirror what SendspinConnection sets after attach  # noqa: SLF001
@@ -482,6 +539,7 @@ async def test_client_updated_event_fires_when_hello_changes() -> None:
     client.attach_connection(
         _DummyConnection(),
         client_info=hello_v1,
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     assert not any(isinstance(e, ClientUpdatedEvent) for e in server.events)
@@ -493,6 +551,7 @@ async def test_client_updated_event_fires_when_hello_changes() -> None:
     client.attach_connection(
         _DummyConnection(),
         client_info=hello_v1,
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     assert not any(isinstance(e, ClientUpdatedEvent) for e in server.events)
@@ -506,6 +565,7 @@ async def test_client_updated_event_fires_when_hello_changes() -> None:
     client.attach_connection(
         _DummyConnection(),
         client_info=hello_v2,
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     updated = [e for e in server.events if isinstance(e, ClientUpdatedEvent)]

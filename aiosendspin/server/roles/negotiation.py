@@ -23,8 +23,8 @@ _FAMILY_ORDER = {
 }
 
 
-def negotiate_active_roles(client_supported_roles: list[str]) -> list[str]:
-    """Negotiate active roles from the client-supported role list.
+def negotiate_roles(client_supported_roles: list[str]) -> list[str]:
+    """Negotiate the mutually-supported role set from the client-supported role list.
 
     For each role family, pick the first role in client order that is
     registered in ROLE_FACTORIES. The result is sorted by the server-defined

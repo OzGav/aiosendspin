@@ -1,0 +1,566 @@
+"""Tests for :mod:`aiosendspin.noise.driver`."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+
+import pytest
+from aiohttp import WSMessage, WSMsgType
+
+from aiosendspin.noise.driver import (
+    HandshakeAbortedError,
+    PskProvider,
+    PskResolver,
+    run_handshake_client,
+    run_handshake_server,
+    run_rehandshake_client,
+    run_rehandshake_server,
+)
+from aiosendspin.noise.keys import Identity, generate_psk, psk_id_for
+from aiosendspin.noise.session import NoiseCipherSuite
+from aiosendspin.noise.trust_store import PskCategory, ResolvedPsk
+
+
+class _PairedFakeWS:
+    """In-memory bidirectional WS satisfying :class:`HandshakeWebSocket`.
+
+    Two instances share a pair of queues — one's outbound is the other's
+    inbound — so the driver's two roles can run against each other via
+    :func:`asyncio.gather`.
+    """
+
+    def __init__(
+        self,
+        send_q: asyncio.Queue[WSMessage | None],
+        recv_q: asyncio.Queue[WSMessage | None],
+    ) -> None:
+        self._send_q = send_q
+        self._recv_q = recv_q
+        self.closed = False
+        self.close_code: int | None = None
+
+    async def send_str(self, data: str) -> None:
+        await self._send_q.put(WSMessage(WSMsgType.TEXT, data, ""))
+
+    async def send_bytes(self, data: bytes) -> None:
+        await self._send_q.put(WSMessage(WSMsgType.BINARY, data, ""))
+
+    async def receive(self) -> WSMessage:
+        msg = await self._recv_q.get()
+        if msg is None:
+            return WSMessage(WSMsgType.CLOSED, None, "")
+        return msg
+
+    async def close(self) -> bool:
+        self.closed = True
+        return True
+
+    def exception(self) -> BaseException | None:
+        return None
+
+    async def close_outbound(self) -> None:
+        """Signal end-of-stream to the peer (yields a CLOSED frame on receive)."""
+        await self._send_q.put(None)
+
+
+def _make_pair() -> tuple[_PairedFakeWS, _PairedFakeWS]:
+    a_to_b: asyncio.Queue[WSMessage | None] = asyncio.Queue()
+    b_to_a: asyncio.Queue[WSMessage | None] = asyncio.Queue()
+    return _PairedFakeWS(a_to_b, b_to_a), _PairedFakeWS(b_to_a, a_to_b)
+
+
+def _resolver(known: dict[str, ResolvedPsk]) -> PskResolver:
+    async def resolve(psk_id: str) -> ResolvedPsk | None:
+        return known.get(psk_id)
+
+    return resolve
+
+
+def _provider(chosen: ResolvedPsk | None) -> PskProvider:
+    async def provide(_client_id: str) -> ResolvedPsk | None:
+        return chosen
+
+    return provide
+
+
+@pytest.mark.parametrize("suite", [NoiseCipherSuite.CHACHAPOLY, NoiseCipherSuite.AESGCM])
+async def test_full_handshake_yields_paired_encrypted_websockets(
+    suite: NoiseCipherSuite,
+) -> None:
+    """Server+client handshake produces two EncryptedWebSockets that talk to each other.
+
+    Parametrized over both spec suites: the server admits whichever the client
+    announces, so this also covers the server's AES-GCM acceptance path.
+    """
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+    psk = generate_psk()
+    psk_id = psk_id_for(psk)
+    # counterparty_id is directional: the server's record names the client; the
+    # client's record names the server.
+    server_resolved = ResolvedPsk(
+        psk_id=psk_id,
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+        counterparty_id=client_id.peer_id,
+    )
+    client_resolved = ResolvedPsk(
+        psk_id=psk_id,
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+        counterparty_id=server_id.peer_id,
+    )
+
+    server_ws, client_ws = _make_pair()
+
+    server_result, client_result = await asyncio.gather(
+        run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(server_resolved),
+        ),
+        run_handshake_client(
+            client_ws,
+            local_identity=client_id,
+            suite=suite,
+            psk_resolver=_resolver({client_resolved.psk_id: client_resolved}),
+        ),
+    )
+
+    assert server_result.peer_id == client_id.peer_id
+    assert client_result.peer_id == server_id.peer_id
+    assert server_result.suite is suite
+    assert client_result.suite is suite
+    assert server_result.psk.psk == client_result.psk.psk
+    # Both sides agree on the Noise handshake hash (used by PIN pairing / CPace).
+    assert server_result.handshake_hash == client_result.handshake_hash
+    assert len(server_result.handshake_hash) == 32
+
+    # Smoke-test a roundtrip over the encrypted channel: server → client.
+    await server_result.encrypted_ws.send_str('{"type":"server/hello"}')
+    await server_ws.close_outbound()  # terminate client's iteration
+    seen = [msg async for msg in client_result.encrypted_ws]
+    assert seen[0].type is WSMsgType.TEXT
+    assert seen[0].data == '{"type":"server/hello"}'
+
+
+async def test_expected_server_id_match_passes() -> None:
+    """run_client accepts a matching ``expected_server_id``."""
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+    psk = generate_psk()
+    resolved = ResolvedPsk(
+        psk_id=psk_id_for(psk),
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+    )
+
+    server_ws, client_ws = _make_pair()
+    await asyncio.gather(
+        run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(resolved),
+        ),
+        run_handshake_client(
+            client_ws,
+            local_identity=client_id,
+            suite=NoiseCipherSuite.CHACHAPOLY,
+            psk_resolver=_resolver({resolved.psk_id: resolved}),
+            expected_server_id=server_id.peer_id,
+        ),
+    )
+
+
+async def test_expected_server_id_mismatch_aborts_client() -> None:
+    """run_client raises HandshakeAbortedError when expected_server_id doesn't match."""
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+    impostor = Identity.generate()
+    psk = generate_psk()
+    resolved = ResolvedPsk(psk_id=psk_id_for(psk), psk=psk, category=PskCategory.LONG_TERM)
+
+    server_ws, client_ws = _make_pair()
+
+    async def server_side() -> None:
+        # Server may or may not complete depending on timing; if it errors we don't care here.
+        with contextlib.suppress(HandshakeAbortedError):
+            await run_handshake_server(
+                server_ws,
+                local_identity=server_id,
+                psk_provider=_provider(resolved),
+            )
+
+    server_task = asyncio.create_task(server_side())
+    with pytest.raises(HandshakeAbortedError, match="server_id mismatch"):
+        await run_handshake_client(
+            client_ws,
+            local_identity=client_id,
+            suite=NoiseCipherSuite.CHACHAPOLY,
+            psk_resolver=_resolver({resolved.psk_id: resolved}),
+            expected_server_id=impostor.peer_id,
+        )
+    server_task.cancel()
+
+
+async def test_expected_client_id_mismatch_aborts_server() -> None:
+    """run_server raises HandshakeAbortedError when expected_client_id doesn't match.
+
+    Mirrors the client-side check for the server-initiated connection case.
+    """
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+    other_client = Identity.generate()
+    psk = generate_psk()
+    resolved = ResolvedPsk(psk_id=psk_id_for(psk), psk=psk, category=PskCategory.SENTINEL)
+
+    server_ws, client_ws = _make_pair()
+
+    async def client_side() -> None:
+        with contextlib.suppress(Exception):
+            await run_handshake_client(
+                client_ws,
+                local_identity=client_id,
+                suite=NoiseCipherSuite.CHACHAPOLY,
+                psk_resolver=_resolver({resolved.psk_id: resolved}),
+            )
+
+    client_task = asyncio.create_task(client_side())
+    with pytest.raises(HandshakeAbortedError, match="client_id mismatch"):
+        await run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(resolved),
+            expected_client_id=other_client.peer_id,
+        )
+    client_task.cancel()
+
+
+async def test_server_psk_provider_returning_none_aborts() -> None:
+    """run_server raises HandshakeAbortedError if psk_provider returns None for the client."""
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+
+    server_ws, client_ws = _make_pair()
+
+    async def client_side() -> None:
+        with contextlib.suppress(HandshakeAbortedError):
+            await run_handshake_client(
+                client_ws,
+                local_identity=client_id,
+                suite=NoiseCipherSuite.CHACHAPOLY,
+                psk_resolver=_resolver({}),
+            )
+
+    client_task = asyncio.create_task(client_side())
+    with pytest.raises(HandshakeAbortedError, match="no PSK admits"):
+        await run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(None),
+        )
+    client_task.cancel()
+
+
+async def test_client_psk_resolver_returning_none_aborts() -> None:
+    """run_client raises HandshakeAbortedError if psk_resolver returns None for the psk_id."""
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+    psk = generate_psk()
+    resolved = ResolvedPsk(psk_id=psk_id_for(psk), psk=psk, category=PskCategory.LONG_TERM)
+
+    server_ws, client_ws = _make_pair()
+
+    async def server_side() -> None:
+        with contextlib.suppress(HandshakeAbortedError):
+            await run_handshake_server(
+                server_ws,
+                local_identity=server_id,
+                psk_provider=_provider(resolved),
+            )
+
+    server_task = asyncio.create_task(server_side())
+    with pytest.raises(HandshakeAbortedError, match="no PSK matches psk_id"):
+        await run_handshake_client(
+            client_ws,
+            local_identity=client_id,
+            suite=NoiseCipherSuite.CHACHAPOLY,
+            psk_resolver=_resolver({}),  # nothing known
+        )
+    server_task.cancel()
+
+
+async def test_server_rejects_unknown_suite() -> None:
+    """run_server raises HandshakeAbortedError if the client picks an unsupported suite."""
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+
+    server_ws, client_ws = _make_pair()
+
+    async def bogus_client() -> None:
+        # Send a hand-crafted client/init with an unsupported suite.
+        bad = (
+            '{"payload":{"client_id":"' + client_id.peer_id + '",'
+            '"version":1,"suite":"25519_AESGCM_SHA512"},"type":"client/init"}'
+        )
+        await client_ws.send_str(bad)
+
+    client_task = asyncio.create_task(bogus_client())
+    with pytest.raises(HandshakeAbortedError, match="unsupported suite"):
+        await run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(None),
+        )
+    await client_task
+
+
+async def test_server_wraps_malformed_client_init_as_handshake_aborted() -> None:
+    """A malformed (non-JSON) client/init surfaces as HandshakeAbortedError, not a raw error."""
+    server_id = Identity.generate()
+    server_ws, client_ws = _make_pair()
+
+    async def bogus_client() -> None:
+        await client_ws.send_str("this is not json")
+
+    client_task = asyncio.create_task(bogus_client())
+    with pytest.raises(HandshakeAbortedError, match="malformed client/init"):
+        await run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(None),
+        )
+    await client_task
+
+
+async def test_handshake_timeout_aborts() -> None:
+    """If the peer never sends, run_server raises HandshakeAbortedError on timeout."""
+    server_id = Identity.generate()
+    server_ws, _client_ws = _make_pair()
+    with pytest.raises(HandshakeAbortedError, match="timed out"):
+        await run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(None),
+            timeout_s=0.05,
+        )
+
+
+async def test_client_post_match_check_rejects_wrong_bound_server_id() -> None:
+    """A stored-pubkey PSK whose counterparty_id != the connected server_id is rejected.
+
+    This is the spec's stored-pubkey post-match check: the PSK record stores the
+    server's identity, and the client must confirm it reached that very server.
+    """
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+    psk = generate_psk()
+    server_resolved = ResolvedPsk(
+        psk_id=psk_id_for(psk),
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+        counterparty_id=client_id.peer_id,
+    )
+    # Client's record claims the PSK belongs to a *different* server.
+    other_server = Identity.generate()
+    client_resolved = ResolvedPsk(
+        psk_id=psk_id_for(psk),
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+        counterparty_id=other_server.peer_id,
+    )
+
+    server_ws, client_ws = _make_pair()
+
+    async def server_side() -> None:
+        with contextlib.suppress(Exception):
+            await run_handshake_server(
+                server_ws,
+                local_identity=server_id,
+                psk_provider=_provider(server_resolved),
+            )
+
+    server_task = asyncio.create_task(server_side())
+    with pytest.raises(HandshakeAbortedError, match="bound to server_id"):
+        await run_handshake_client(
+            client_ws,
+            local_identity=client_id,
+            suite=NoiseCipherSuite.CHACHAPOLY,
+            psk_resolver=_resolver({client_resolved.psk_id: client_resolved}),
+        )
+    server_task.cancel()
+
+
+async def test_shared_psk_record_admits_any_server() -> None:
+    """A shared-PSK record (counterparty_id=None) skips the post-match check.
+
+    The client accepts the advertised server_id at face value, so the handshake
+    completes even though the record is not bound to this server (spec's
+    shared-PSK model).
+    """
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+    psk = generate_psk()
+    psk_id = psk_id_for(psk)
+    server_resolved = ResolvedPsk(
+        psk_id=psk_id,
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+        counterparty_id=client_id.peer_id,
+    )
+    # Shared-PSK record: no bound server_id.
+    client_resolved = ResolvedPsk(
+        psk_id=psk_id,
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+        counterparty_id=None,
+    )
+
+    server_ws, client_ws = _make_pair()
+
+    server_result, client_result = await asyncio.gather(
+        run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(server_resolved),
+        ),
+        run_handshake_client(
+            client_ws,
+            local_identity=client_id,
+            suite=NoiseCipherSuite.CHACHAPOLY,
+            psk_resolver=_resolver({client_resolved.psk_id: client_resolved}),
+        ),
+    )
+
+    assert client_result.peer_id == server_id.peer_id
+    assert client_result.psk.counterparty_id is None
+    assert server_result.psk.psk == client_result.psk.psk
+
+
+async def test_psk_mismatch_after_lookup_aborts_initiator() -> None:
+    """Responder returning a wrong PSK causes the initiator's msg2 AEAD to fail."""
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+    real_psk = generate_psk()
+    wrong_psk = generate_psk()
+    server_resolved = ResolvedPsk(
+        psk_id=psk_id_for(real_psk),
+        psk=real_psk,
+        category=PskCategory.LONG_TERM,
+    )
+    # Client resolves the (correct) psk_id but returns the WRONG psk bytes.
+    client_resolved = ResolvedPsk(
+        psk_id=psk_id_for(real_psk),
+        psk=wrong_psk,
+        category=PskCategory.LONG_TERM,
+    )
+
+    server_ws, client_ws = _make_pair()
+
+    async def client_side() -> None:
+        with contextlib.suppress(HandshakeAbortedError):
+            await run_handshake_client(
+                client_ws,
+                local_identity=client_id,
+                suite=NoiseCipherSuite.CHACHAPOLY,
+                psk_resolver=_resolver({server_resolved.psk_id: client_resolved}),
+            )
+
+    client_task = asyncio.create_task(client_side())
+    # The initiator authenticates msg2 with real_psk; the responder mixed the
+    # wrong PSK, so the AEAD tag fails — the driver wraps that as
+    # HandshakeAbortedError (uniform handshake-failure contract).
+    with pytest.raises(HandshakeAbortedError, match="failed Noise authentication"):
+        await run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(server_resolved),
+        )
+    await asyncio.wait_for(client_task, timeout=1.0)
+
+
+async def test_rehandshake_swaps_keys_in_transport_mode() -> None:
+    """A re-handshake over the encrypted channel installs a new session both sides.
+
+    After the initial handshake, the server re-runs the handshake in transport
+    mode to swap to a different PSK (mirroring trust promotion after pairing).
+    The two ``noise/handshake`` messages travel doubly encrypted under the
+    current keys; once swapped, traffic flows under the new keys and both sides
+    agree on a fresh handshake hash.
+    """
+    server_id = Identity.generate()
+    client_id = Identity.generate()
+
+    # Initial session keyed by PSK #1.
+    psk1 = generate_psk()
+    server_psk1 = ResolvedPsk(
+        psk_id=psk_id_for(psk1),
+        psk=psk1,
+        category=PskCategory.SENTINEL,
+    )
+    client_psk1 = ResolvedPsk(psk_id=psk_id_for(psk1), psk=psk1, category=PskCategory.SENTINEL)
+
+    server_ws, client_ws = _make_pair()
+    server_init, client_init = await asyncio.gather(
+        run_handshake_server(
+            server_ws,
+            local_identity=server_id,
+            psk_provider=_provider(server_psk1),
+        ),
+        run_handshake_client(
+            client_ws,
+            local_identity=client_id,
+            suite=NoiseCipherSuite.CHACHAPOLY,
+            psk_resolver=_resolver({client_psk1.psk_id: client_psk1}),
+        ),
+    )
+
+    # New long-term PSK #2 to re-handshake into.
+    psk2 = generate_psk()
+    server_psk2 = ResolvedPsk(
+        psk_id=psk_id_for(psk2),
+        psk=psk2,
+        category=PskCategory.LONG_TERM,
+        counterparty_id=client_id.peer_id,
+    )
+    client_psk2 = ResolvedPsk(
+        psk_id=psk_id_for(psk2),
+        psk=psk2,
+        category=PskCategory.LONG_TERM,
+        counterparty_id=server_id.peer_id,
+    )
+
+    server_re, client_re = await asyncio.gather(
+        run_rehandshake_server(
+            server_init.encrypted_ws,
+            local_identity=server_id,
+            client_id=client_id.peer_id,
+            suite=server_init.suite,
+            prologue=server_init.handshake_hash,
+            psk=server_psk2,
+        ),
+        run_rehandshake_client(
+            client_init.encrypted_ws,
+            local_identity=client_id,
+            server_id=server_id.peer_id,
+            suite=client_init.suite,
+            prologue=client_init.handshake_hash,
+            psk_resolver=_resolver({client_psk2.psk_id: client_psk2}),
+        ),
+    )
+
+    # Same wrapper object, new session: both sides agree on a fresh hash that
+    # differs from the initial one.
+    assert server_re.encrypted_ws is server_init.encrypted_ws
+    assert client_re.encrypted_ws is client_init.encrypted_ws
+    assert server_re.handshake_hash == client_re.handshake_hash
+    assert server_re.handshake_hash != server_init.handshake_hash
+    assert server_re.psk.psk == psk2
+
+    # Traffic now flows under the new keys.
+    await server_re.encrypted_ws.send_str('{"type":"server/activate"}')
+    await server_ws.close_outbound()
+    seen = [msg async for msg in client_re.encrypted_ws]
+    assert seen[0].type is WSMsgType.TEXT
+    assert seen[0].data == '{"type":"server/activate"}'

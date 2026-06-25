@@ -377,6 +377,10 @@ class Role(ABC):
         from the corresponding GroupRole.
         """
 
+    def on_deactivate(self) -> None:
+        """Handle the role leaving active_roles while the client stays connected."""
+        self._unsubscribe_from_group_role()
+
     def _subscribe_to_group_role(self) -> None:
         """Subscribe to the corresponding GroupRole (call from on_connect)."""
         if group_role := self._client.group.group_role(self.role_family):
@@ -384,7 +388,7 @@ class Role(ABC):
             self._group_role = group_role
 
     def _unsubscribe_from_group_role(self) -> None:
-        """Unsubscribe from the GroupRole (call from on_disconnect)."""
+        """Unsubscribe from the GroupRole (call from on_disconnect / on_deactivate)."""
         if self._group_role:
             self._group_role.unsubscribe(self)
             self._group_role = None

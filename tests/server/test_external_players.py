@@ -16,6 +16,8 @@ from aiosendspin.models.types import (
     PlayerCommand,
     Roles,
 )
+from aiosendspin.noise.keys import Identity
+from aiosendspin.noise.trust_store import InMemoryServerPairingStore
 from aiosendspin.server import ClientAddedEvent, ExternalStreamStartRequest, SendspinServer
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.client import SendspinClient
@@ -116,9 +118,10 @@ def _make_server() -> SendspinServer:
     client_session.close = AsyncMock()
     return SendspinServer(
         loop=loop,
-        server_id="srv",
+        identity=Identity.generate(),
         server_name="server",
         client_session=client_session,
+        pairing_store=InMemoryServerPairingStore(),
     )
 
 
@@ -198,6 +201,7 @@ async def test_attach_connection_reuses_external_cold_preinitialized_roles() -> 
     player.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("external-reuse"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
 
@@ -221,6 +225,7 @@ async def test_attach_connection_rebuilds_roles_when_cold_preinit_mismatches() -
     player.attach_connection(
         _DummyConnection(),
         client_info=_player_and_metadata_hello("external-mismatch"),
+        negotiated_roles=[Roles.PLAYER.value, Roles.METADATA.value],
         active_roles=[Roles.PLAYER.value, Roles.METADATA.value],
     )
 
@@ -325,6 +330,7 @@ async def test_add_external_player_to_active_group_requests_external_connect() -
     owner.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("owner"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     owner.mark_connected()
@@ -391,6 +397,7 @@ async def test_add_external_preconnect_player_to_active_group_replays_cached_aud
     owner.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("owner-preconnect"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     owner.mark_connected()
@@ -458,6 +465,7 @@ async def test_add_external_non_preconnect_player_to_active_group_skips_role_joi
     owner.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("owner-cold"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
     owner.mark_connected()
@@ -510,6 +518,7 @@ async def test_register_external_player_timeout_cancelled_on_transport_attach() 
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("external-connected"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
 
@@ -607,6 +616,7 @@ async def test_reclaim_timeout_cancelled_on_transport_attach(
     client.attach_connection(
         _DummyConnection(),
         client_info=_player_hello("speaker-connected"),
+        negotiated_roles=[Roles.PLAYER.value],
         active_roles=[Roles.PLAYER.value],
     )
 

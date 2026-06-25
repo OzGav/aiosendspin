@@ -362,7 +362,7 @@ class SendspinGroup:
             self._finalize_empty_group()
         else:
             # Stop a remnant with no player-role client left to source audio.
-            if not any(has_role_family("player", c.negotiated_roles) for c in self._clients):
+            if not any(has_role_family("player", c.negotiated_role_ids) for c in self._clients):
                 await self._stop_and_invalidate_stale_binary(self._clients)
             # Emit event for client removal
             self._signal_event(GroupMemberRemovedEvent(client.client_id))
