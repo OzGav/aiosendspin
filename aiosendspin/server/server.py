@@ -710,16 +710,24 @@ class SendspinServer:
         try:
             self._tcp_site = web.TCPSite(
                 self._app_runner,
-                host=host if host != "0.0.0.0" else None,
+                host=host if host not in ("0.0.0.0", "::") else None,
                 port=port,
             )
             await self._tcp_site.start()
             logger.info("Sendspin server started successfully on %s:%d", host, port)
 
-            self._zc = AsyncZeroconf(
-                ip_version=IPVersion.V4Only,
-                interfaces=[host] if host != "0.0.0.0" else InterfaceChoice.Default,
-            )
+            if host in ("0.0.0.0", "::"):
+                # wildcard bind: let zeroconf pick the interfaces itself
+                zc_interfaces: InterfaceChoice | list[str] = InterfaceChoice.Default
+                zc_ip_version = IPVersion.All if host == "::" else IPVersion.V4Only
+            else:
+                zc_interfaces = [host]
+                zc_ip_version = (
+                    IPVersion.V6Only
+                    if ip_address(host).version == 6
+                    else IPVersion.V4Only
+                )
+            self._zc = AsyncZeroconf(ip_version=zc_ip_version, interfaces=zc_interfaces)
 
             if advertise_addresses is not None:
                 addresses = advertise_addresses
